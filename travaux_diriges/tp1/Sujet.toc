@@ -1,5 +1,0 @@
-\contentsline {section}{\numberline {1}Produit matrice--matrice}{1}{section.1}%
-\contentsline {section}{\numberline {2}Parallélisation MPI}{2}{section.2}%
-\contentsline {subsection}{\numberline {2.1}Circulation d'un jeton dans un anneau}{2}{subsection.2.1}%
-\contentsline {subsection}{\numberline {2.2}Calcul tr\`es approch\'e de pi}{3}{subsection.2.2}%
-\contentsline {subsection}{\numberline {2.3}Diffusion d'un entier dans un réseau hypercube\textcolor {red}{$^{\star }$}}{4}{subsection.2.3}%
