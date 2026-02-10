@@ -23,14 +23,7 @@ On itère ensuite pour étudier la façon dont évolue la population des cellule
 """
 import pygame  as pg
 import numpy   as np
-from mpi4py import MPI
 
-globCom = MPI.COMM_WORLD.Dup()
-rank = globCom.Get_rank()
-nbp  = globCom.Get_size()
-
-newCom = globCom.Split(rank != 0, rank)
-print(f"rang global : {rank}, rang local : {newCom.Get_rank()}, nb de processus locaux : {newCom.Get_size()}")
 
 class Grille:
     """
@@ -44,19 +37,14 @@ class Grille:
     Exemple :
        grid = Grille( (10,10), init_pattern=[(2,2),(0,2),(4,2),(2,0),(2,4)], color_life=pg.Color("red"), color_dead=pg.Color("black"))
     """
-    def __init__(self, rank : int, nbp : int, dim, init_pattern=None, color_life=pg.Color("black"), color_dead=pg.Color("white")):
+    def __init__(self, dim, init_pattern=None, color_life=pg.Color("black"), color_dead=pg.Color("white")):
         import random
         self.dimensions = dim
-        self.dimensions_loc = (dim[0]//nbp + (1 if rank < dim[0]%nbp else 0),dim[1])
-        self.start_loc = rank * self.dimensions_loc[0] + (dim[0]%nbp if rank >= dim[0]%nbp else 0)
-
         if init_pattern is not None:
-            self.cells = np.zeros((self.dimensions_loc[0]+2,self.dimensions_loc[1]), dtype=np.uint8)
-            indices_i = [v[0]-self.start_loc+1 for v in init_pattern 
-                         if v[0] >= self.start_loc and v[0] < self.start_loc+self.dimensions_loc[0]]
+            self.cells = np.zeros(self.dimensions, dtype=np.uint8)
+            indices_i = [v[0] for v in init_pattern]
             indices_j = [v[1] for v in init_pattern]
-            if len(indices_i) > 0:
-                self.cells[indices_i,indices_j] = 1
+            self.cells[indices_i,indices_j] = 1
         else:
             self.cells = np.random.randint(2, size=dim, dtype=np.uint8)
         self.col_life = color_life
@@ -66,22 +54,37 @@ class Grille:
         """
         Calcule la prochaine génération de cellules en suivant les règles du jeu de la vie
         """
-        neighbours_count = sum(np.roll(np.roll(self.cells, i, 0), j, 1) for i in (-1, 0, 1) for j in (-1, 0, 1) if (i != 0 or j != 0))  
-        next_cells = (neighbours_count == 3) | (self.cells & (neighbours_count == 2))
-        diff_cells = (next_cells != self.cells)
+        # Remarque 1: on pourrait optimiser en faisant du vectoriel, mais pour plus de clarté, on utilise les boucles
+        # Remarque 2: on voit la grille plus comme une matrice qu'une grille géométrique. L'indice (0,0) est donc en bas
+        #             à gauche de la grille !
+        ny = self.dimensions[0]
+        nx = self.dimensions[1]
+        next_cells = np.empty(self.dimensions, dtype=np.uint8)
+        diff_cells = []
+        for i in range(ny):
+            i_above = (i+ny-1)%ny
+            i_below = (i+1)%ny
+            for j in range(nx):
+                j_left = (j-1+nx)%nx
+                j_right= (j+1)%nx
+                voisins_i = [i_above,i_above,i_above, i     , i      , i_below, i_below, i_below]
+                voisins_j = [j_left ,j      ,j_right, j_left, j_right, j_left , j      , j_right]
+                voisines = np.array(self.cells[voisins_i,voisins_j])
+                nb_voisines_vivantes = np.sum(voisines)
+                if self.cells[i,j] == 1: # Si la cellule est vivante
+                    if (nb_voisines_vivantes < 2) or (nb_voisines_vivantes > 3):
+                        next_cells[i,j] = 0 # Cas de sous ou sur population, la cellule meurt
+                        diff_cells.append(i*nx+j)
+                    else:
+                        next_cells[i,j] = 1 # Sinon elle reste vivante
+                elif nb_voisines_vivantes == 3: # Cas où cellule morte mais entourée exactement de trois vivantes
+                    next_cells[i,j] = 1         # Naissance de la cellule
+                    diff_cells.append(i*nx+j)
+                else:
+                    next_cells[i,j] = 0         # Morte, elle reste morte.
         self.cells = next_cells
         return diff_cells
 
-    def update_ghost_cells(self):
-        """
-        Met à jour les cellules fantômes
-        """
-        req1 = newCom.Irecv(self.cells[-1,:], source = (newCom.rank+1)%newCom.size, tag=101)
-        req2 = newCom.Irecv(self.cells[0,:], source = (newCom.rank+newCom.size-1)%newCom.size, tag=102)
-        newCom.Send(self.cells[-2,:], dest = (newCom.rank+1)%newCom.size, tag=102)
-        newCom.Send(self.cells[1,:], dest = (newCom.rank+newCom.size-1)%newCom.size, tag=101)
-        req1.Wait()
-        req2.Wait()
 
 class App:
     """
@@ -105,13 +108,21 @@ class App:
         self.screen = pg.display.set_mode((self.width,self.height))
         #
         self.canvas_cells = []
-        self.colors = np.array([self.grid.col_dead[:-1], self.grid.col_life[:-1]])
+
+    def compute_rectangle(self, i: int, j: int):
+        """
+        Calcul la géométrie du rectangle correspondant à la cellule (i,j)
+        """
+        return (self.size_x*j, self.height - self.size_y*(i + 1), self.size_x, self.size_y)
+
+    def compute_color(self, i: int, j: int):
+        if self.grid.cells[i,j] == 0:
+            return self.grid.col_dead
+        else:
+            return self.grid.col_life
 
     def draw(self):
-        surface = pg.surfarray.make_surface(self.colors[self.grid.cells[1:-1,:].T])
-        surface = pg.transform.flip(surface, False, True)
-        surface = pg.transform.scale(surface, (self.width, self.height))
-        self.screen.blit(surface, (0,0))
+        [self.screen.fill(self.compute_color(i,j),self.compute_rectangle(i,j)) for i in range(self.grid.dimensions[0]) for j in range(self.grid.dimensions[1])]
         if (self.draw_color is not None):
             [pg.draw.line(self.screen, self.draw_color, (0,i*self.size_y), (self.width,i*self.size_y)) for i in range(self.grid.dimensions[0])]
             [pg.draw.line(self.screen, self.draw_color, (j*self.size_x,0), (j*self.size_x,self.height)) for j in range(self.grid.dimensions[1])]
@@ -122,6 +133,7 @@ if __name__ == '__main__':
     import time
     import sys
 
+    pg.init()
     dico_patterns = { # Dimension et pattern dans un tuple
         'blinker' : ((5,5),[(2,1),(2,2),(2,3)]),
         'toad'    : ((6,6),[(2,2),(2,3),(2,4),(3,3),(3,4),(3,5)]),
@@ -129,7 +141,7 @@ if __name__ == '__main__':
         "beacon"  : ((6,6), [(1,3),(1,4),(2,3),(2,4),(3,1),(3,2),(4,1),(4,2)]),
         "boat" : ((5,5),[(1,1),(1,2),(2,1),(2,3),(3,2)]),
         "glider": ((100,90),[(1,1),(2,2),(2,3),(3,1),(3,2)]),
-        "glider_gun": ((200,100),[(51,76),(52,74),(52,76),(53,64),(53,65),(53,72),(53,73),(53,86),(53,87),(54,63),(54,67),(54,72),(54,73),(54,86),(54,87),(55,52),(55,53),(55,62),(55,68),(55,72),(55,73),(56,52),(56,53),(56,62),(56,66),(56,68),(56,69),(56,74),(56,76),(57,62),(57,68),(57,76),(58,63),(58,67),(59,64),(59,65)]),
+        "glider_gun": ((400,400),[(51,76),(52,74),(52,76),(53,64),(53,65),(53,72),(53,73),(53,86),(53,87),(54,63),(54,67),(54,72),(54,73),(54,86),(54,87),(55,52),(55,53),(55,62),(55,68),(55,72),(55,73),(56,52),(56,53),(56,62),(56,66),(56,68),(56,69),(56,74),(56,76),(57,62),(57,68),(57,76),(58,63),(58,67),(59,64),(59,65)]),
         "space_ship": ((25,25),[(11,13),(11,14),(12,11),(12,12),(12,14),(12,15),(13,11),(13,12),(13,13),(13,14),(14,12),(14,13)]),
         "die_hard" : ((100,100), [(51,57),(52,51),(52,52),(53,52),(53,56),(53,57),(53,58)]),
         "pulsar": ((17,17),[(2,4),(2,5),(2,6),(7,4),(7,5),(7,6),(9,4),(9,5),(9,6),(14,4),(14,5),(14,6),(2,10),(2,11),(2,12),(7,10),(7,11),(7,12),(9,10),(9,11),(9,12),(14,10),(14,11),(14,12),(4,2),(5,2),(6,2),(4,7),(5,7),(6,7),(4,9),(5,9),(6,9),(4,14),(5,14),(6,14),(10,2),(11,2),(12,2),(10,7),(11,7),(12,7),(10,9),(11,9),(12,9),(10,14),(11,14),(12,14)]),
@@ -153,47 +165,19 @@ if __name__ == '__main__':
     except KeyError:
         print("No such pattern. Available ones are:", dico_patterns.keys())
         exit(1)
-    if rank == 0:
-        pg.init()
-        grid = Grille(0, 1, *init_pattern)
-        appli = App((resx, resy), grid)
-        loop = True
-        while loop:
-            globCom.send(1, dest=1)
-            appli.grid.cells[1:-1,:] = globCom.recv(source=1)
-            t2 = time.time()
-            appli.draw()
-            t3 = time.time()
-            for event in pg.event.get():
-                if event.type == pg.QUIT:
-                    loop = False
-                    pg.quit()
-                    globCom.send(-1,dest=1)
-            print(f"Temps affichage : {t3-t2:2.2e} secondes", flush=True)
-    else:
-        grid = Grille(newCom.rank, newCom.size, *init_pattern)
-        grid.update_ghost_cells()
-        print(f"rank loc : {newCom.rank}, cells locales : \n{grid.cells.T}")
+    grid = Grille(*init_pattern)
+    appli = App((resx, resy), grid)
 
-        grid_glob = None
-        if newCom.rank == 0:
-            grid_glob = np.zeros(init_pattern[0], dtype=np.uint8)
-        sendcounts = np.array(newCom.gather(grid.cells[1:-1,:].size, root=0))
-
-        loop = True
-        while loop:
-            #time.sleep(0.1) # A régler ou commenter pour vitesse maxi
-            t1 = time.time()
-            diff = grid.compute_next_iteration()
-            grid.update_ghost_cells()
-            t2 = time.time()
-            newCom.Gatherv(grid.cells[1:-1,:], [grid_glob, sendcounts], root=0)
-            if newCom.rank == 0:
-                if (globCom.Iprobe(source=0)):
-                    a = globCom.recv(source=0)
-                    if a==-1:
-                        loop = False
-                    else:
-                        globCom.send(grid_glob, dest=0)
-            print(f"Temps calcul prochaine generation : {t2-t1:2.2e} secondes", flush=True)
-
+    mustContinue = True
+    while mustContinue:
+        #time.sleep(0.5) # A régler ou commenter pour vitesse maxi
+        t1 = time.time()
+        diff = grid.compute_next_iteration()
+        t2 = time.time()
+        appli.draw()
+        t3 = time.time()
+        for event in pg.event.get():
+            if event.type == pg.QUIT:
+                mustContinue = False
+        print(f"Temps calcul prochaine generation : {t2-t1:2.2e} secondes, temps affichage : {t3-t2:2.2e} secondes\r", end='');
+    pg.quit()
